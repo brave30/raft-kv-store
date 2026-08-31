@@ -1,0 +1,23 @@
+# Raft node state written at runtime (each node's persisted term/vote/log).
+# These are regenerated on every run and would otherwise produce a noisy
+# diff after each demo — they're output, not source.
+data/
+*_state.json
+*_state.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local-only Claude Code tool permissions (machine-specific, not project config)
+.claude/settings.local.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
