@@ -16,11 +16,11 @@ just writing the code for it.
 ## Roadmap
 1. **Data model + persistence** — DONE (see below)
 2. **Leader election** — DONE (see below)
-3. **Log replication** — NEXT UP. AppendEntries RPC carrying real log entries,
-   leader tracking nextIndex/matchIndex per follower, commit index
-   advancing once a majority acknowledges.
-4. **Client API** — a simple way to SET/GET keys against the cluster
-   (writes go to the leader; reads can be served locally or forwarded).
+3. **Log replication** — DONE (see below)
+4. **Client API** — NEXT UP. Leader forwarding so clients don't have to
+   shop around for the leader, and linearizable reads (leader confirms
+   it's still leader via a heartbeat round before answering, or uses a
+   read index). The write path already exists and commits correctly.
 5. **Chaos testing** — script that kills/restarts nodes mid-write to
    prove data survives — this becomes the demo GIF/log output for the
    GitHub README.
@@ -89,12 +89,67 @@ Verified end-to-end: 3 processes elect a leader, killing the leader
 triggers a new election in a higher term, and the restarted old leader
 rejoins as a follower without stealing leadership back.
 
+## What's built so far (Phase 3 — log replication)
+
+- `raft_kv/store.py` — `KeyValueStore`, the state machine the log is
+  replayed into. The key rule documented there: commands must be
+  deterministic *facts*, never instructions to compute something. A
+  command containing `now()` would make every node compute a different
+  value and diverge silently, with Raft none the wiser.
+
+- `raft_kv/state.py` — added `entry_at`, `term_at` (isolating the 1-based
+  log index vs 0-based list off-by-one in one place) and `overwrite_from`
+  (truncate + append in a single disk write).
+
+- `raft_kv/node.py` — the big one. Added:
+  - `next_index` / `match_index` per follower (guess vs confirmed fact)
+  - the AppendEntries consistency check via prev_log_index/prev_log_term,
+    with a conflict-index hint so repairing a badly lagging follower
+    takes one round trip instead of one per missing entry
+  - `_merge_entries` — truncates only on a genuine term conflict, never
+    blindly (see the bug note below)
+  - `_advance_commit_index` — majority counting, plus the current-term
+    restriction from Figure 8 of the paper
+  - `_apply_committed` — feeds committed entries into the store, in order
+  - `submit()` — accepts a client write and blocks until a majority has
+    it, then reports success. Refuses on a non-leader and names the leader.
+  - a new leader appends a NOOP from its own term, so it always has
+    something committable and old stranded entries get carried to safety
+
+- `raft_kv/server.py` — added `/write` and `/read` endpoints.
+
+- `scripts/run_cluster.py` — added `set <k> <v>` and `get <k>`; `get`
+  queries every node so replication is visible.
+
+- `tests/test_replication.py` — 19 tests.
+
+**Two real bugs caught while building this, both the same shape:** the
+leader is itself a replica, and forgetting that strands the degenerate
+case. (1) A single-node cluster never committed, because commit
+advancement only ran when a follower *replied* — with no peers, no
+replies. (2) Same root cause as the Phase 2 bug where a single-node
+cluster never counted its own vote. Worth remembering as a category:
+whenever logic is triggered by a peer response, ask what happens with
+zero peers.
+
+**Also fixed:** `_advance_commit_index` / `_apply_committed` originally
+documented a "caller must hold the lock" contract, which is a footgun.
+They now take the lock themselves — safe because `self.lock` is an
+`RLock`, so nesting under callers that already hold it is fine.
+
+Verified end-to-end with 3 processes: two writes replicate to all three
+nodes, killing the leader preserves all committed data and elects a new
+leader, the cluster keeps accepting writes with 2 of 3 up, and the
+restarted node catches up to an identical store.
+
 Run everything with:
 ```
 cd raft-kv-store
 python tests/test_state.py
 python tests/test_election.py
-python scripts/run_cluster.py     # then type: status / kill node1 / status
+python tests/test_replication.py
+python scripts/run_cluster.py
+# then: set colour blue / get colour / kill <leader> / get colour / start <id>
 ```
 
 ## Key design decisions worth remembering
@@ -120,9 +175,8 @@ python scripts/run_cluster.py     # then type: status / kill node1 / status
 
 ## Suggested first prompt to Claude Code when resuming
 "Continue the Raft KV store project — read PROJECT_NOTES.md for
-context, then let's build Phase 3 (log replication): make AppendEntries
-carry real entries, have the leader track nextIndex/matchIndex per
-follower, and advance the commit index once a majority has acknowledged
-an entry. Explain the reasoning as we go since I'm new to distributed
-systems, then let's watch an entry replicate across 3 nodes and survive
-a leader crash."
+context, then let's build Phase 4 (client API): have followers forward
+writes to the leader instead of making the client shop around, and make
+reads linearizable so a stale follower or a just-deposed leader can't
+return old data. Explain the reasoning as we go since I'm new to
+distributed systems."

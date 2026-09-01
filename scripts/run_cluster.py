@@ -9,9 +9,21 @@ the election as a single ordered story instead of juggling three windows.
 Once it's running, type commands at the prompt:
 
     status        — ask every node what it thinks its role is
+    set <k> <v>   — write a key (auto-routed to the leader)
+    get <k>       — read a key from EVERY node, to see replication
     kill <id>     — hard-kill a node (simulates a crash). Kill the leader!
     start <id>    — bring a killed node back (it reloads state from disk)
     quit          — shut everything down
+
+Try this sequence to see the whole point of the project:
+
+    set colour blue
+    get colour            # all three nodes agree
+    kill <whoever is leader>
+    get colour            # survivors still have it; a new leader took over
+    set colour red        # the cluster still accepts writes with 2 of 3 up
+    start <the dead node>
+    get colour            # the restarted node catches up to "red"
 
 WHY A 3-NODE CLUSTER:
 A majority of 3 is 2, so the cluster tolerates exactly ONE failure and
@@ -111,6 +123,67 @@ def show_status() -> None:
     print("  ------------------------")
 
 
+def post(port: int, path: str, payload: dict, timeout: float = 5.0) -> dict | None:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode())
+    except Exception:
+        return None
+
+
+def do_set(key: str, value: str) -> None:
+    """
+    Write a key. We don't know which node is leader, so we try each one;
+    followers refuse and tell us who the leader is. Phase 4 will make the
+    cluster handle this redirect itself instead of making the client shop
+    around — for now, doing it out here keeps the node's data path honest
+    about who is actually allowed to accept a write.
+    """
+    command = {"op": "SET", "key": key, "value": value}
+    for node_id, port in NODES.items():
+        reply = post(port, "/write", {"command": command})
+        if reply is None:
+            continue
+        if reply.get("ok"):
+            print(f"  OK: {key}={value} committed at log index {reply['index']}")
+            return
+        if reply.get("error") == "not_leader":
+            hint = reply.get("leader_id")
+            if hint in NODES:
+                retry = post(NODES[hint], "/write", {"command": command})
+                if retry and retry.get("ok"):
+                    print(f"  OK: {key}={value} committed at log index "
+                          f"{retry['index']} (via {hint})")
+                    return
+        else:
+            print(f"  {node_id} refused: {reply.get('error')}")
+    print("  FAILED: no leader accepted the write "
+          "(is a majority of the cluster up?)")
+
+
+def do_get(key: str) -> None:
+    """
+    Read from every node so you can SEE replication — all three should
+    report the same value. (These are local reads, so a lagging follower
+    may briefly differ; that's expected, and Phase 4 addresses it.)
+    """
+    print(f"  ---- get {key} ----")
+    for node_id, port in NODES.items():
+        reply = post(port, "/read", {"key": key}, timeout=1.0)
+        if reply is None:
+            print(f"  {node_id}: DOWN")
+        else:
+            print(f"  {node_id}: {key}={reply['value']!r} "
+                  f"({reply['role']}, applied through #{reply['applied_index']})")
+    print("  -------------------")
+
+
 def main() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     # Start from a clean slate each run so terms don't climb forever
@@ -140,6 +213,10 @@ def main() -> None:
                 break
             elif verb == "status":
                 show_status()
+            elif verb == "set" and len(parts) == 3:
+                do_set(parts[1], parts[2])
+            elif verb == "get" and len(parts) == 2:
+                do_get(parts[1])
             elif verb in ("kill", "start") and len(parts) == 2:
                 target = parts[1]
                 if target not in NODES:
@@ -149,7 +226,8 @@ def main() -> None:
                 else:
                     start_node(target)
             else:
-                print("  commands: status | kill <id> | start <id> | quit")
+                print("  commands: status | set <k> <v> | get <k> | "
+                      "kill <id> | start <id> | quit")
     except KeyboardInterrupt:
         pass
     finally:

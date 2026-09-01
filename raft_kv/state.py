@@ -108,6 +108,55 @@ class PersistentState:
         self.log = [e for e in self.log if e.index < index]
         self._save()
 
+    def overwrite_from(self, index: int, entries: list[LogEntry]) -> None:
+        """
+        Delete everything from `index` onward, then append `entries` —
+        in a SINGLE disk write.
+
+        Why one method instead of calling truncate_from() then
+        append_entries()? Those would be two separate saves, and a crash
+        in between would leave the node on disk with entries deleted and
+        the replacements missing. Not fatal (the leader would just resend
+        them) but it needlessly throws away data we already had in hand.
+        One write, one atomic rename, no window.
+        """
+        self.log = [e for e in self.log if e.index < index]
+        self.log.extend(entries)
+        self._save()
+
+    def entry_at(self, index: int) -> LogEntry | None:
+        """
+        The entry at a 1-based log index, or None if we don't have it.
+
+        The log list is 0-based while Raft indices are 1-based, so entry
+        `i` lives at `self.log[i - 1]`. Rather than scatter that off-by-one
+        across the codebase (where it would eventually be gotten wrong),
+        it's isolated right here.
+        """
+        if index < 1 or index > len(self.log):
+            return None
+        entry = self.log[index - 1]
+        # Cheap internal consistency check. If this ever fires, the log
+        # list and the entries' own index fields have drifted apart, which
+        # would mean a bug in truncation — better to fail loudly than to
+        # silently replicate a corrupted log.
+        assert entry.index == index, f"log corrupted: slot {index} holds {entry.index}"
+        return entry
+
+    def term_at(self, index: int) -> int:
+        """
+        The term of the entry at `index`; 0 for index 0 (the empty log).
+
+        Index 0 is a useful fiction: it's the position "before the first
+        entry," and every node trivially agrees about it. That gives the
+        consistency check in AppendEntries a base case, so a leader
+        replicating to a completely empty follower needs no special path.
+        """
+        if index == 0:
+            return 0
+        entry = self.entry_at(index)
+        return entry.term if entry else 0
+
     def last_log_index(self) -> int:
         return self.log[-1].index if self.log else 0
 

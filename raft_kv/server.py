@@ -66,8 +66,16 @@ def main() -> None:
         host=args.host,
         port=args.port,
         handlers={
+            # Node-to-node consensus RPCs
             "/request_vote": node.handle_request_vote,
             "/append_entries": node.handle_append_entries,
+            # Client-facing endpoints. Deliberately on the same port and
+            # server as the consensus RPCs for now — Phase 4 is where the
+            # client API grows a real front end (leader forwarding,
+            # linearizable reads). These exist so Phase 3's replication
+            # can be driven and observed.
+            "/write": node.handle_client_write,
+            "/read": node.handle_client_read,
             "/status": node.handle_status,
         },
     )
