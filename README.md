@@ -22,8 +22,8 @@ refuses to answer rather than return stale data.
 | 2. Leader election (RequestVote, heartbeats, failover) | Done |
 | 3. Log replication (AppendEntries, commit index, KV store) | Done |
 | 4. Client API (forwarding, linearizable reads) | Done |
-| 5. Chaos testing (kill nodes mid-write, prove durability) | Next |
-| 6. Benchmarking (throughput, latency, recovery time) | Planned |
+| 5. Chaos testing (kill nodes mid-write, prove durability) | Done |
+| 6. Benchmarking (throughput, latency, recovery time) | Next |
 
 ## What works today
 
@@ -178,6 +178,7 @@ deterministic and instant.
 | `raft_kv/server.py` | CLI entry point — one OS process per node |
 | `raft_kv/client.py` | Client library + CLI (retries, leader-agnostic) |
 | `scripts/run_cluster.py` | Local 3-node cluster launcher |
+| `scripts/chaos_test.py` | Randomised kill/restart testing with a verifier |
 
 ## Design notes
 
@@ -199,6 +200,81 @@ failure. Kill a second and the survivor campaigns forever without winning
 — that's Raft correctly refusing to proceed without a majority. Lost
 availability is recoverable; lost consensus is not. This is also why
 cluster sizes are odd: 4 nodes tolerate only 1 failure, same as 3.
+
+## Chaos testing
+
+Unit tests only cover situations someone thought to write down. Consensus
+bugs live in interleavings nobody imagined — a leader dying between
+appending an entry and replicating it, a write landing exactly as
+leadership changes hands. So the cluster is also tested by generating
+those situations at random, under load, and checking an invariant that
+must hold regardless of what happened.
+
+```bash
+python scripts/chaos_test.py                 # 45s run
+python scripts/chaos_test.py --duration 120  # longer finds more
+python scripts/chaos_test.py --seed 31337    # replay an exact run
+```
+
+Writers hammer the cluster while nodes are killed at random — biased
+toward killing the **leader**, since failover is where the interesting
+bugs are. Every run prints its seed so a failure can be reproduced
+exactly.
+
+```
+  acknowledged writes : 1409   (MUST all survive)
+  unknown outcome     : 0      (may or may not survive)
+  node kills          : 20
+  leader kills        : 11     (each forces an election)
+  quorum losses       : 4
+  final term          : 21     (20 leadership changes)
+
+  node1: FOLLOWER  term=21 commit=2849 keys=1410
+  node2: FOLLOWER  term=21 commit=2849 keys=1410
+  node3: LEADER    term=21 commit=2849 keys=1410
+
+  PASS  all nodes hold identical data
+  PASS  all 1409 acknowledged writes survived with correct values
+  PASS  no fabricated keys
+  PASS  contended key holds a genuinely written value
+  PASS  linearizable reads agree with replicated state
+
+RESULT: PASSED - 1409 acknowledged writes survived 20 node kills
+```
+
+### The oracle is the hard part
+
+Killing processes is easy; deciding what "correct" means afterwards takes
+the thought. The key insight:
+
+> **A failed request is not proof the operation didn't happen.**
+
+If a write times out, the entry may already be on a majority and commit a
+moment later. The client cannot distinguish "never happened" from
+"happened but I didn't hear back." So outcomes fall into three buckets:
+
+| Outcome | Requirement |
+|---|---|
+| Client received `ok` | **MUST** be present — this is the durability promise |
+| Timeout, error, or no answer | **MAY** be present — either result is correct |
+| Key nobody ever wrote | **MUST NOT** exist — fabricated data is always a bug |
+
+Asserting that timed-out writes are *absent* would be the classic
+mistake, and would fail constantly against a perfectly healthy cluster.
+
+### A test that looked thorough and wasn't
+
+The first version killed nodes uniformly at random. It ran clean: hundreds
+of writes, several kills, everything verified. But the final state showed
+`term=1` — meaning **no election had ever happened**. It had mostly killed
+followers, which barely disturbs anything, and never once exercised
+failover.
+
+The fix was to bias killing toward the leader, and to report the final
+term (which rises with every leadership change) so a run that skips
+failover is visible rather than silently reassuring. A chaos test that
+never triggers the interesting path is worse than no chaos test, because
+it produces confidence it hasn't earned.
 
 ## Three details that look wrong and aren't
 

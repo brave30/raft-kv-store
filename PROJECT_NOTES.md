@@ -18,9 +18,7 @@ just writing the code for it.
 2. **Leader election** — DONE (see below)
 3. **Log replication** — DONE (see below)
 4. **Client API** — DONE (see below)
-5. **Chaos testing** — script that kills/restarts nodes mid-write to
-   prove data survives — this becomes the demo GIF/log output for the
-   GitHub README.
+5. **Chaos testing** — DONE (see below)
 6. **Benchmarking + polish** — throughput, latency, leader-election
    recovery time. These numbers go in the resume bullet.
 
@@ -179,6 +177,41 @@ timed out (`commit_timeout`), and then actually committed at index 5
 once quorum was restored. A timeout is genuinely "unknown", not
 "failed" — which is exactly why retries need idempotent commands.
 
+## What's built so far (Phase 5 — chaos testing)
+
+- `scripts/chaos_test.py` — writers hammer the cluster while a
+  "chaos monkey" kills and restarts nodes at random; afterwards
+  everything is restarted, convergence is awaited, and invariants are
+  checked. Seeded RNG, with the seed printed every run so a failure is
+  reproducible (`--seed N`).
+
+**The oracle is the hard part, not the chaos.** The governing insight:
+a FAILED REQUEST IS NOT PROOF THE OPERATION DIDN'T HAPPEN. A timed-out
+write may already be on a majority and commit moments later. So:
+  - client got `ok`  -> MUST be present (the durability promise)
+  - anything else    -> MAY be present (both outcomes correct)
+  - key never written -> MUST NOT exist (fabricated data)
+Asserting that timed-out writes are ABSENT would be the classic mistake
+and would fail constantly on a healthy cluster.
+
+Also verified: all nodes byte-identical at the end, the contended key
+holds a value someone really wrote, and linearizable reads agree with
+the replicated state.
+
+**Lesson worth remembering — a test that looked thorough and wasn't.**
+The first version killed nodes uniformly at random. It passed with
+hundreds of writes and several kills... and `term=1` in the final state,
+meaning NO ELECTION EVER HAPPENED. It had mostly killed followers, which
+barely disturbs the cluster, so failover — the whole interesting path —
+went completely untested. Fixed by biasing kills toward the leader (75%)
+and reporting the final term so a run that skips failover is visible.
+Generalisable: always check that a randomised test actually reached the
+states it was written to explore.
+
+Results: 6+ seeds pass. Longest run (90s, 4 writers, seed 31337):
+1409 acknowledged writes, 20 node kills, 11 leader kills, 4 quorum
+losses, 20 leadership changes — zero data loss, all nodes identical.
+
 Run everything with:
 ```
 cd raft-kv-store
@@ -186,6 +219,7 @@ python tests/test_state.py
 python tests/test_election.py
 python tests/test_replication.py
 python tests/test_client_api.py
+python scripts/chaos_test.py --duration 60
 python scripts/run_cluster.py
 # then: set colour blue / get colour / kill <leader> / get colour / start <id>
 
@@ -217,8 +251,7 @@ python -m raft_kv.client get colour
 
 ## Suggested first prompt to Claude Code when resuming
 "Continue the Raft KV store project — read PROJECT_NOTES.md for
-context, then let's build Phase 5 (chaos testing): a script that hammers
-the cluster with writes while randomly killing and restarting nodes,
-then verifies afterwards that every acknowledged write is still present
-and all nodes agree. This becomes the demo output for the README.
-Explain the reasoning as we go since I'm new to distributed systems."
+context, then let's build Phase 6 (benchmarking + polish): measure write
+throughput, write latency (p50/p99), and leader-election recovery time,
+so I have real numbers for a resume bullet. Explain the reasoning as we
+go since I'm new to distributed systems."
