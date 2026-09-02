@@ -116,6 +116,18 @@ HEARTBEAT_INTERVAL = 0.5
 # follower before a majority has it.
 COMMIT_WAIT_TIMEOUT = 3.0
 
+# How long a linearizable read waits for a majority to confirm we are
+# still leader. Shorter than COMMIT_WAIT_TIMEOUT: this is one round trip
+# with no disk work, so if it hasn't happened quickly, something is wrong
+# and the client is better served by a fast failure than a slow answer.
+LEADERSHIP_CONFIRM_TIMEOUT = 1.5
+
+# A forwarded request gets a longer deadline than a direct one, because it
+# includes the leader's own commit wait on the far side. Without the extra
+# headroom the follower would give up while the leader was still correctly
+# working on the request.
+FORWARD_TIMEOUT = COMMIT_WAIT_TIMEOUT + 2.0
+
 
 class RaftNode:
     def __init__(self, node_id: str, peers: dict[str, str], storage_path: str):
@@ -711,33 +723,170 @@ class RaftNode:
             return {"ok": True, "index": index, "term": term}
 
     def handle_client_write(self, msg: dict) -> dict:
-        """HTTP entry point for a write. See submit()."""
+        """
+        HTTP entry point for a write.
+
+        If we're not the leader we FORWARD to whoever is, rather than
+        bouncing the client back with a redirect. From the client's point
+        of view any node accepts writes, which is what you want from a
+        cluster — the client shouldn't have to track leadership, which can
+        change between the redirect and the retry anyway.
+        """
         command = msg.get("command")
         if not isinstance(command, dict) or "op" not in command:
             return {"ok": False, "error": "bad_command"}
-        return self.submit(command)
+
+        with self.lock:
+            is_leader = self.role == LEADER
+            leader_id = self.leader_id
+
+        if is_leader:
+            return self.submit(command)
+
+        return self._forward("/write", msg, leader_id,
+                             already_forwarded=msg.get("forwarded", False))
+
+    def _forward(self, path: str, msg: dict, leader_id: str | None,
+                 already_forwarded: bool) -> dict:
+        """
+        Pass a client request along to the leader and relay its answer.
+
+        The `forwarded` flag prevents an infinite loop. Consider two nodes
+        that each believe the other is leader — briefly possible during a
+        changeover. Without the flag they would bounce the request back
+        and forth until something timed out, consuming a thread on each
+        node per hop. One hop is always enough: if the node we forward to
+        isn't the leader either, the client should retry rather than have
+        us chase leadership around the cluster.
+        """
+        if already_forwarded:
+            # We were forwarded to, but we're not the leader either. Don't
+            # forward again — report honestly and let the client retry.
+            return {"ok": False, "error": "not_leader", "leader_id": leader_id}
+
+        if leader_id is None or leader_id not in self.peers:
+            # No known leader: either an election is in progress right now,
+            # or we're partitioned away from the cluster. Both are genuinely
+            # "try again shortly" conditions, not permanent failures.
+            return {"ok": False, "error": "no_known_leader", "leader_id": None}
+
+        url = self.peers[leader_id]
+        forwarded = dict(msg)
+        forwarded["forwarded"] = True
+        reply = send_rpc(f"{url}{path}", forwarded, timeout=FORWARD_TIMEOUT)
+        if reply is None:
+            # The leader we knew about didn't answer — it may have just
+            # died. Our election timer will notice shortly.
+            return {"ok": False, "error": "leader_unreachable",
+                    "leader_id": leader_id}
+        reply["forwarded_by"] = self.node_id
+        return reply
 
     def handle_client_read(self, msg: dict) -> dict:
         """
-        Read a key from this node's applied state.
+        Read a key.
 
-        HONEST CAVEAT: this is a LOCAL read, and it is not linearizable.
-        A follower can be slightly behind, and even a leader might have
-        been deposed moments ago without knowing it yet — so a read here
-        can return a stale value. Making reads strongly consistent needs
-        the leader to confirm it's still leader (via a heartbeat round)
-        before answering. That's Phase 4; for now the weaker guarantee is
-        stated rather than hidden, because a read path that quietly lies
-        is worse than one that documents its limits.
+        Two consistency levels, chosen by the caller:
+
+          "linearizable" (default) — the real guarantee. The read is
+              served by the leader, and only after the leader has proven
+              it is STILL the leader. Any value returned reflects every
+              write that had been acknowledged before the read began.
+
+          "local" — read whatever this node happens to have applied. Fast
+              and needs no network, but a follower may be behind and a
+              deposed leader may not know it yet. Useful when staleness is
+              acceptable (dashboards, caches) and worth offering
+              explicitly so the choice is visible rather than accidental.
+
+        Offering both, and defaulting to the safe one, is the point: the
+        weaker mode is a decision the caller makes on purpose.
+        """
+        key = msg.get("key")
+        consistency = msg.get("consistency", "linearizable")
+
+        if consistency == "local":
+            with self.lock:
+                return {
+                    "ok": True, "key": key, "value": self.store.get(key),
+                    "consistency": "local", "role": self.role,
+                    "leader_id": self.leader_id,
+                    "applied_index": self.last_applied,
+                }
+
+        if consistency != "linearizable":
+            return {"ok": False, "error": "bad_consistency_level"}
+
+        with self.lock:
+            is_leader = self.role == LEADER
+            leader_id = self.leader_id
+
+        if not is_leader:
+            return self._forward("/read", msg, leader_id,
+                                 already_forwarded=msg.get("forwarded", False))
+
+        return self._linearizable_read(key)
+
+    def _linearizable_read(self, key: str) -> dict:
+        """
+        The ReadIndex algorithm. Three steps, each necessary:
+
+          1. Make sure we've committed an entry from our OWN term. A
+             brand-new leader may not yet know which older entries are
+             committed — it knows its log is complete (the election
+             guaranteed that), but not how far commitment reached under
+             the previous leader. Committing one of our own entries
+             resolves that. The no-op appended at election time is exactly
+             this entry, so in practice this wait is already satisfied.
+
+          2. Record the current commit index, THEN confirm leadership with
+             a majority. The order matters: capturing the index first and
+             confirming after means the confirmed round vouches for an
+             index that was already decided when we started, so no write
+             can sneak in behind our answer.
+
+          3. Wait until we've APPLIED up to that index before reading the
+             store. commit_index is what the cluster has decided;
+             last_applied is what our local store actually reflects.
+             Reading between the two would miss a write that is already
+             committed and therefore already acknowledged to some client.
         """
         with self.lock:
-            key = msg.get("key")
+            if self.role != LEADER:
+                return {"ok": False, "error": "not_leader",
+                        "leader_id": self.leader_id}
+            # Step 1
+            if self.state.term_at(self.commit_index) != self.state.current_term:
+                return {"ok": False, "error": "leader_not_ready",
+                        "detail": "no entry from the current term is committed yet"}
+            # Step 2 (capture before confirming)
+            read_index = self.commit_index
+            term = self.state.current_term
+
+        if not self._confirm_still_leader():
+            # We could not prove current leadership. We may well still be
+            # leader — but "probably" is not a guarantee, and the whole
+            # point of this path is to never return a value we can't
+            # stand behind. Fail instead.
+            return {"ok": False, "error": "leadership_not_confirmed",
+                    "detail": "could not reach a majority; may have been partitioned"}
+
+        # Step 3
+        deadline = time.monotonic() + LEADERSHIP_CONFIRM_TIMEOUT
+        with self.lock:
+            while self.last_applied < read_index:
+                if self.role != LEADER or self.state.current_term != term:
+                    return {"ok": False, "error": "leadership_lost",
+                            "leader_id": self.leader_id}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"ok": False, "error": "apply_timeout"}
+                self._commit_changed.wait(remaining)
+
             return {
-                "ok": True,
-                "key": key,
-                "value": self.store.get(key),
-                "role": self.role,
-                "leader_id": self.leader_id,
+                "ok": True, "key": key, "value": self.store.get(key),
+                "consistency": "linearizable", "role": self.role,
+                "leader_id": self.node_id, "read_index": read_index,
                 "applied_index": self.last_applied,
             }
 
@@ -809,23 +958,8 @@ class RaftNode:
         with self.lock:
             if self.role != LEADER:
                 return
-            work = []
-            for peer_id, url in self.peers.items():
-                next_idx = self.next_index.get(peer_id, 1)
-                prev_index = next_idx - 1
-                entries = [
-                    e.to_dict()
-                    for e in self.state.log
-                    if e.index >= next_idx
-                ]
-                work.append((peer_id, url, {
-                    "term": self.state.current_term,
-                    "leader_id": self.node_id,
-                    "prev_log_index": prev_index,
-                    "prev_log_term": self.state.term_at(prev_index),
-                    "entries": entries,
-                    "leader_commit": self.commit_index,
-                }))
+            work = [(peer_id, self.peers[peer_id], self._build_append_payload(peer_id))
+                    for peer_id in self.peers]
             leader_term = self.state.current_term
 
         for peer_id, url, payload in work:
@@ -835,16 +969,42 @@ class RaftNode:
                 daemon=True,
             ).start()
 
-    def _replicate_one(self, peer_id: str, url: str, payload: dict, leader_term: int) -> None:
+    def _build_append_payload(self, peer_id: str) -> dict:
+        """
+        Construct the AppendEntries message for one specific follower.
+
+        Caller must hold the lock (this reads next_index and the log
+        together, and they must not change between the two reads).
+        """
+        next_idx = self.next_index.get(peer_id, 1)
+        prev_index = next_idx - 1
+        return {
+            "term": self.state.current_term,
+            "leader_id": self.node_id,
+            "prev_log_index": prev_index,
+            "prev_log_term": self.state.term_at(prev_index),
+            "entries": [e.to_dict() for e in self.state.log if e.index >= next_idx],
+            "leader_commit": self.commit_index,
+        }
+
+    def _replicate_one(self, peer_id: str, url: str, payload: dict,
+                       leader_term: int) -> bool:
+        """
+        Send one AppendEntries and process the reply.
+
+        Returns True if the follower ACCEPTED it — meaning it recognises
+        us as leader for this term. _confirm_still_leader counts those
+        acceptances to prove our leadership is current.
+        """
         reply = send_rpc(f"{url}/append_entries", payload)
         if reply is None:
-            return  # Follower down. We'll retry on the next heartbeat.
+            return False  # Follower down. We'll retry on the next heartbeat.
 
         with self.lock:
             # Same staleness check as in the vote path: this reply may
             # describe a world we've already left.
             if self.role != LEADER or self.state.current_term != leader_term:
-                return
+                return False
 
             # A follower can inform a leader that it's been deposed — this
             # is how a leader that was network-partitioned away rejoins the
@@ -853,7 +1013,7 @@ class RaftNode:
                 self.log(f"append rejected by {peer_id}: term "
                          f"{reply['term']} > ours. Stepping down.")
                 self._become_follower(reply["term"])
-                return
+                return False
 
             if reply["success"]:
                 # They now hold everything we sent. Record it as FACT.
@@ -873,6 +1033,7 @@ class RaftNode:
                         self.match_index.get(peer_id, 0), payload["prev_log_index"])
                 # A follower catching up may have just made a majority.
                 self._advance_commit_index()
+                return True
             else:
                 # Consistency check failed: our guess about where their
                 # log ends was too optimistic. Back off and retry from the
@@ -887,26 +1048,92 @@ class RaftNode:
                 # heartbeat per step would take a very long time.
                 threading.Thread(target=self._replicate_to_peer,
                                  args=(peer_id,), daemon=True).start()
+                # A rejection still proves this follower accepts our
+                # TERM (it would have reported a higher one otherwise),
+                # so it counts as a leadership acknowledgement even
+                # though the log entries weren't accepted.
+                return True
 
     def _replicate_to_peer(self, peer_id: str) -> None:
         """Send AppendEntries to ONE follower, using its current next_index."""
         with self.lock:
             if self.role != LEADER or peer_id not in self.peers:
                 return
-            next_idx = self.next_index.get(peer_id, 1)
-            prev_index = next_idx - 1
-            payload = {
-                "term": self.state.current_term,
-                "leader_id": self.node_id,
-                "prev_log_index": prev_index,
-                "prev_log_term": self.state.term_at(prev_index),
-                "entries": [e.to_dict() for e in self.state.log if e.index >= next_idx],
-                "leader_commit": self.commit_index,
-            }
+            payload = self._build_append_payload(peer_id)
             leader_term = self.state.current_term
             url = self.peers[peer_id]
 
         self._replicate_one(peer_id, url, payload, leader_term)
+
+    def _confirm_still_leader(self, timeout: float = LEADERSHIP_CONFIRM_TIMEOUT) -> bool:
+        """
+        Prove, right now, that we are still the leader — by getting a
+        majority of the cluster to accept an AppendEntries from us.
+
+        WHY A LEADER CANNOT JUST TRUST ITSELF:
+        Nothing tells a leader it has been deposed. If the network
+        partitions us away from the cluster, we keep believing we're
+        leader — our own term never changes, and no message arrives to
+        correct us. Meanwhile the majority on the other side elects a new
+        leader and starts committing writes. We are now a "zombie leader":
+        confident, and wrong. Serving a read from our own state here would
+        return data that is out of date by an unbounded amount.
+
+        The proof: if a MAJORITY still accepts a message at our term, then
+        no leader of a higher term can have been elected — electing one
+        would itself require a majority, and any two majorities overlap,
+        so at least one node would have had to both accept us and vote for
+        a higher term, which it cannot do. So a successful round here means
+        that as of the moment it started, we really were the only leader.
+
+        Note this costs a network round trip per read. That's the honest
+        price of a linearizable read. Real systems soften it by batching
+        concurrent reads into one confirmation round, or by using a
+        "leader lease" — trusting an election-timeout-long lease instead
+        of confirming, which is faster but trades a safety proof for a
+        clock-drift assumption. We do the simple, provably-correct thing.
+        """
+        with self.lock:
+            if self.role != LEADER:
+                return False
+            term = self.state.current_term
+            work = [(peer_id, self.peers[peer_id], self._build_append_payload(peer_id))
+                    for peer_id in self.peers]
+            needed = self._majority()
+
+        # We count as one acknowledgement — we're a member of the cluster.
+        # In a single-node cluster this is already a majority, so the loop
+        # below never runs and the read costs nothing.
+        acks = 1
+        acks_lock = threading.Lock()
+        reached = threading.Event()
+        if acks >= needed:
+            reached.set()
+
+        def probe(peer_id: str, url: str, payload: dict) -> None:
+            nonlocal acks
+            # Reuse the normal replication path so this round also does
+            # useful work: it carries entries, updates match_index, and
+            # steps us down if a follower reports a higher term.
+            if self._replicate_one(peer_id, url, payload, term):
+                with acks_lock:
+                    acks += 1
+                    if acks >= needed:
+                        reached.set()
+
+        for peer_id, url, payload in work:
+            threading.Thread(target=probe, args=(peer_id, url, payload),
+                             daemon=True).start()
+
+        reached.wait(timeout)
+
+        with self.lock:
+            # Even with a majority of acks, re-check that we didn't step
+            # down partway through (a follower may have reported a higher
+            # term while other probes were succeeding).
+            return (reached.is_set()
+                    and self.role == LEADER
+                    and self.state.current_term == term)
 
     # ==================================================================
     # THE TICKER — the node's heartbeat of activity

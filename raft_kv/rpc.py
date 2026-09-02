@@ -49,12 +49,19 @@ from typing import Any, Callable
 RPC_TIMEOUT_SECONDS = 0.5
 
 
-def send_rpc(url: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+def send_rpc(url: str, payload: dict[str, Any],
+             timeout: float = RPC_TIMEOUT_SECONDS) -> dict[str, Any] | None:
     """
     Send one JSON-over-HTTP RPC. Returns the decoded reply, or None if
     the peer was unreachable / too slow / returned something unusable.
 
     Returning None instead of raising is deliberate: see note 2 above.
+
+    `timeout` defaults to the short consensus deadline. Forwarded CLIENT
+    requests override it with something longer, because the leader on the
+    far side has to replicate to a majority before it can answer — a
+    deadline tuned for a heartbeat would abandon a request that was
+    proceeding perfectly normally.
     """
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -64,7 +71,7 @@ def send_rpc(url: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=RPC_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         # Peer is down, slow, or babbling. All three are the same to us.

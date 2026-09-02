@@ -11,17 +11,18 @@ randomized, why a majority is what makes single-leadership safe.
 
 ## Status
 
-**It replicates. Writes committed by a majority survive killing the
-leader.** The client API is still minimal — reads are local, so they're
-not yet linearizable, and clients find the leader by asking around.
+**A working replicated key-value store with linearizable reads.** Writes
+commit only once a majority has them on disk, any node accepts a request
+and forwards it to the leader, and a leader that can't reach a majority
+refuses to answer rather than return stale data.
 
 | Phase | Status |
 |---|---|
 | 1. Persistent state (term, vote, log survive a crash) | Done |
 | 2. Leader election (RequestVote, heartbeats, failover) | Done |
 | 3. Log replication (AppendEntries, commit index, KV store) | Done |
-| 4. Client API (leader forwarding, linearizable reads) | Next |
-| 5. Chaos testing (kill nodes mid-write, prove durability) | Planned |
+| 4. Client API (forwarding, linearizable reads) | Done |
+| 5. Chaos testing (kill nodes mid-write, prove durability) | Next |
 | 6. Benchmarking (throughput, latency, recovery time) | Planned |
 
 ## What works today
@@ -107,8 +108,47 @@ curl -X POST http://127.0.0.1:5001/write \
 curl -X POST http://127.0.0.1:5001/read -d '{"key": "colour"}'
 ```
 
-A `/write` returns only once a majority has the entry on disk. A
-non-leader refuses it and names the leader instead.
+A `/write` returns only once a majority has the entry on disk. Any node
+accepts one — non-leaders forward to the leader internally.
+
+Or use the client CLI, which needs to know nothing about who leads:
+
+```bash
+python -m raft_kv.client set colour blue
+python -m raft_kv.client get colour
+python -m raft_kv.client get colour --local   # opt in to a stale read
+python -m raft_kv.client delete colour
+python -m raft_kv.client status
+```
+
+## Reads: two consistency levels
+
+```python
+from raft_kv.client import RaftClient
+
+client = RaftClient(["http://127.0.0.1:5001", "http://127.0.0.1:5002"])
+client.set("colour", "blue")
+client.get("colour")                        # linearizable (default)
+client.get("colour", consistency="local")   # fast, may be stale
+```
+
+**Linearizable** is the default: the read is served by the leader, and
+only after the leader has proven it is *still* leader by getting a
+majority to accept a message from it. Any value returned reflects every
+write acknowledged before the read began.
+
+That proof is not optional paranoia. A leader that gets partitioned away
+has no idea — nothing tells it, and its own term never changes. It keeps
+believing it leads while the majority elects a successor and moves on. A
+read from that "zombie leader" would be confidently, unboundedly stale.
+The confirmation round costs a network round trip per read; that is the
+honest price of the guarantee. (Production systems soften it by batching
+concurrent reads into one round, or by trading the proof for a
+clock-drift assumption via leader leases.)
+
+**Local** reads skip all of that and return whatever that node has
+applied. Fast, no network, possibly stale — appropriate when staleness is
+acceptable, and something you have to ask for explicitly.
 
 ## Tests
 
@@ -116,6 +156,7 @@ non-leader refuses it and names the leader instead.
 python tests/test_state.py        # crash recovery of persistent state
 python tests/test_election.py     # the voting rules (12 tests)
 python tests/test_replication.py  # replication and commit rules (19 tests)
+python tests/test_client_api.py   # forwarding and read consistency (13 tests)
 ```
 
 The election tests deliberately avoid the network and timers, calling the
@@ -135,6 +176,7 @@ deterministic and instant.
 | `raft_kv/rpc.py` | JSON-over-HTTP transport between nodes |
 | `raft_kv/node.py` | The Follower/Candidate/Leader state machine |
 | `raft_kv/server.py` | CLI entry point — one OS process per node |
+| `raft_kv/client.py` | Client library + CLI (retries, leader-agnostic) |
 | `scripts/run_cluster.py` | Local 3-node cluster launcher |
 
 ## Design notes
@@ -188,14 +230,20 @@ the other is a fact (what a follower has actually confirmed). Commit
 decisions count only the facts. Committing off the optimistic guess would
 mean declaring data safe that no follower necessarily has.
 
+**A leader can't be trusted to know it's the leader.** See the read
+consistency section above — this is why every linearizable read pays for
+a majority confirmation round.
+
 ## Known limitations
 
-- **Reads are local and not linearizable.** A `/read` returns whatever
-  that node has applied, so a lagging follower — or a leader that was
-  just deposed and doesn't know it — can return a stale value. Phase 4.
-- **Clients find the leader by asking around.** A non-leader refuses a
-  write and names the leader; the client retries there. The cluster
-  should do that forwarding itself. Phase 4.
+- **A write timeout means "unknown", not "failed".** If a write times out
+  waiting for commitment, it may still commit moments later — the client
+  raises a distinct `WriteOutcomeUnknown` for this rather than pretending
+  to know. Retrying is safe here only because every command is
+  idempotent: `SET` and `DELETE` applied twice equal applied once. A
+  hypothetical `INCREMENT` would need per-client sequence numbers so the
+  cluster could recognise and discard a duplicate. That restriction on
+  the command set is a deliberate design decision, not an oversight.
 - **The log grows forever.** No snapshotting or compaction, so a
   long-running node replays its entire history on restart.
 - **Fixed cluster membership.** Nodes are passed on the command line at

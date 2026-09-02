@@ -17,10 +17,7 @@ just writing the code for it.
 1. **Data model + persistence** — DONE (see below)
 2. **Leader election** — DONE (see below)
 3. **Log replication** — DONE (see below)
-4. **Client API** — NEXT UP. Leader forwarding so clients don't have to
-   shop around for the leader, and linearizable reads (leader confirms
-   it's still leader via a heartbeat round before answering, or uses a
-   read index). The write path already exists and commits correctly.
+4. **Client API** — DONE (see below)
 5. **Chaos testing** — script that kills/restarts nodes mid-write to
    prove data survives — this becomes the demo GIF/log output for the
    GitHub README.
@@ -142,14 +139,59 @@ nodes, killing the leader preserves all committed data and elects a new
 leader, the cluster keeps accepting writes with 2 of 3 up, and the
 restarted node catches up to an identical store.
 
+## What's built so far (Phase 4 — client API)
+
+- `raft_kv/node.py`:
+  - `_forward()` — non-leaders now forward client requests to the leader
+    instead of bouncing the client back with a redirect. A `forwarded`
+    flag caps this at ONE hop: two nodes can briefly each believe the
+    other leads, and without the flag a request would ping-pong between
+    them consuming a thread per hop.
+  - `_confirm_still_leader()` — proves current leadership by getting a
+    majority to accept an AppendEntries. Reuses `_replicate_one` (now
+    returning a bool) so the confirmation round also does useful
+    replication work.
+  - `_linearizable_read()` — the ReadIndex algorithm: (1) require a
+    committed entry from the current term, (2) capture commit_index THEN
+    confirm leadership, (3) wait for last_applied to catch up, then read.
+  - `handle_client_read` takes a `consistency` option: "linearizable"
+    (default) or "local".
+
+- `raft_kv/client.py` — client library + CLI. Retries across nodes for a
+  window longer than an election, distinguishes transient errors from
+  permanent ones, and raises a SEPARATE `WriteOutcomeUnknown` for commit
+  timeouts because that case genuinely is unknown, not failed.
+
+- `tests/test_client_api.py` — 13 tests, mostly asserting the node
+  REFUSES to answer when it can't stand behind the answer.
+
+**The core insight of this phase:** a leader has no way to know it has
+been deposed. Nothing tells it; its own term never changes. A
+partitioned leader keeps believing it leads for up to an election
+timeout while the other side elects a successor and commits new writes.
+So "send reads to the leader" is NOT sufficient for correctness — the
+leader must prove leadership at read time. Verified live: with both
+followers killed, the isolated leader still reported role=leader, served
+a local read, and correctly REFUSED the linearizable read.
+
+**Also observed live, worth remembering:** the isolated leader's write
+timed out (`commit_timeout`), and then actually committed at index 5
+once quorum was restored. A timeout is genuinely "unknown", not
+"failed" — which is exactly why retries need idempotent commands.
+
 Run everything with:
 ```
 cd raft-kv-store
 python tests/test_state.py
 python tests/test_election.py
 python tests/test_replication.py
+python tests/test_client_api.py
 python scripts/run_cluster.py
 # then: set colour blue / get colour / kill <leader> / get colour / start <id>
+
+# or drive it from another terminal:
+python -m raft_kv.client set colour blue
+python -m raft_kv.client get colour
 ```
 
 ## Key design decisions worth remembering
@@ -175,8 +217,8 @@ python scripts/run_cluster.py
 
 ## Suggested first prompt to Claude Code when resuming
 "Continue the Raft KV store project — read PROJECT_NOTES.md for
-context, then let's build Phase 4 (client API): have followers forward
-writes to the leader instead of making the client shop around, and make
-reads linearizable so a stale follower or a just-deposed leader can't
-return old data. Explain the reasoning as we go since I'm new to
-distributed systems."
+context, then let's build Phase 5 (chaos testing): a script that hammers
+the cluster with writes while randomly killing and restarting nodes,
+then verifies afterwards that every acknowledged write is still present
+and all nodes agree. This becomes the demo output for the README.
+Explain the reasoning as we go since I'm new to distributed systems."
